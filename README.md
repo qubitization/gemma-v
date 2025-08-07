@@ -36,8 +36,8 @@ OPENROUTER_API_KEY=""
 python gemma_v.py
 
 # Say "Go to YouTube and play a video about quantum computing, and skip advertisement if there is one"
-# Press ⌘ to stop the assistant’s speech (if assistant is speaking)
-# Press ⌘ to start a new browser task (if youtube video is palying)
+# Press ⌘ to stop the assistant’s speech (if the assistant is speaking)
+# Press ⌘ to start a new browser task (if a YouTube video is palying)
 ```
 
 
