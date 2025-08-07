@@ -12,12 +12,8 @@ Demo: https://www.youtube.com/watch?v=e6HVVWYjdtw
 ```
 conda create -n gemmav python=3.11.8
 conda activate gemmav
-conda install -c conda-forge torchaudio ffmpeg librosa numpy pynput
-
-pip install torch mlx mlx-lm mlx-vlm sounddevice 
-pip install piper-tts rustymimi moshi-mlx huggingface-hub sentencepiece 
-pip install --upgrade huggingface-hub
-pip install parakeet-mlx -U
+conda install -c conda-forge "ffmpeg=7.1.1"
+pip install "torch==2.7.1" "torchaudio==2.7.1" "numpy==2.2.6" "pynput==1.8.1" "mlx==0.26.5" "mlx-lm==0.26.1" "mlx-vlm==0.3.2" "sounddevice==0.5.0" "piper-tts==1.3.0" "parakeet-mlx==0.3.5" 
 ```
 
 
@@ -28,7 +24,7 @@ wget 'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/l
 ```
 
 ```
-pip install browser-use==0.5.5
+pip install "browser-use==0.5.5"
 playwright install --with-deps
 # create a .env file in project's root, and add your OPENROUTER_API_KEY
 OPENROUTER_API_KEY=""
@@ -40,11 +36,13 @@ OPENROUTER_API_KEY=""
 python gemma_v.py
 
 # Say "Go to YouTube and play a video about quantum computing, and skip advertisement if there is one"
+# Press ⌘ to stop the assistant’s speech (if assistant is speaking)
+# Press ⌘ to start a new browser task (if youtube video is palying)
 ```
 
 
 
 ## References
 
-- https://huggingface.co/mlx-community/gemma-3n-E4B-it-4bit/tree/main
+- https://huggingface.co/mlx-community/gemma-3n-E4B-it-4bit
 

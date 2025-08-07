@@ -592,8 +592,8 @@ class BrowserController:
         self.monitor_task: asyncio.Task | None = None
         self._monitor_stop_event = asyncio.Event()
 
-        if not os.getenv("GOOGLE_API_KEY") and not os.getenv("OPENROUTER_API_KEY"):
-            logging.critical("API key (GOOGLE or OPENROUTER) environment variable is not set. Browser-use functionality will fail.")
+        if not os.getenv("OPENROUTER_API_KEY"):
+            logging.critical("API key OPENROUTER environment variable is not set. Browser-use functionality will fail.")
             self.tts.play_greeting("Error: An API key is not set. Browser functions are disabled.")
 
     YOUTUBE_VIDEO_URL_PATTERNS = [
@@ -653,7 +653,6 @@ class BrowserController:
                         logging.info(f"[URL Monitor] No longer on a video page. Clearing video_is_playing_event.")
                         self.video_is_playing_event.clear()
                 else:
-                    # THE FIX: Instead of breaking, just wait and retry.
                     logging.warning("[URL Monitor] Browser session not ready yet. Waiting...")
                     await asyncio.sleep(1.0) # Wait for 1 second before checking again
                     continue # Continue to the next loop iteration
@@ -704,7 +703,7 @@ class BrowserController:
             llm = ChatOpenAI(
                 model='google/gemini-2.5-flash-lite',
                 base_url='https://openrouter.ai/api/v1',
-                api_key=os.getenv('OPENROUTER_API_KEY') or os.getenv('GOOGLE_API_KEY'),
+                api_key=os.getenv('OPENROUTER_API_KEY'),
             )
 
             agent = Agent(
@@ -808,21 +807,15 @@ class VoiceAssistant:
             logging.error(f"Error in coroutine execution: {e}", exc_info=True)
             return e
 
-    # --- MODIFIED: The `finally` block now correctly handles state cleanup ---
     def _handle_browser_task(self, task: str):
         try:
-            # This coroutine returns when the agent's main task is done OR when it's interrupted by the user.
             self._submit_coro_and_wait(
                 self.browser_controller.run_browser_task(task, self.go_home_event)
             )
 
-            # If the task was interrupted by the 'go home' command, run_browser_task already handled it.
-            # We can exit this thread and let the 'finally' block clean up the events.
             if self.go_home_event.is_set():
                 return
 
-            # If the agent's task finished on its own AND a video is now playing,
-            # this thread must NOT exit. It must stay alive to listen for the 'go home' command.
             if self.video_is_playing_event.is_set():
                 logging.info("Browser thread entered post-task monitoring. Waiting for 'Go Home' signal or navigation away.")
                 # This loop keeps the thread alive, polling for two conditions to exit:
@@ -840,15 +833,9 @@ class VoiceAssistant:
         except Exception as e:
             logging.error(f"Error running browser task thread: {e}", exc_info=True)
         finally:
-            # This 'finally' block now reliably executes after the browser task is TRULY finished,
-            # either by interruption, normal completion, or post-task reset.
-            
-            # If the user navigates away manually, the URL monitor will clear this. If the user
-            # used the command key, we clear it here to ensure the state is immediately correct.
             if self.video_is_playing_event.is_set():
                 self.video_is_playing_event.clear()
 
-            # Always clear the go_home_event to reset the state for the next command.
             self.go_home_event.clear()
             logging.info("Browser task thread finished. Assistant is ready for new commands.")
 
@@ -943,8 +930,8 @@ if __name__ == "__main__":
     try:
         if not Path(Config.PIPER_MODEL_PATH).exists():
             print(f"{TermColors.SYSTEM}Error: Piper TTS model not found at '{Config.PIPER_MODEL_PATH}'. Please check the path in the Config class.{TermColors.ENDC}")
-        elif not os.getenv("GOOGLE_API_KEY") and not os.getenv("OPENROUTER_API_KEY"):
-             print(f"{TermColors.SYSTEM}Error: GOOGLE_API_KEY or OPENROUTER_API_KEY not found in environment variables. Please set one for browser tasks.{TermColors.ENDC}")
+        elif not os.getenv("OPENROUTER_API_KEY"):
+             print(f"{TermColors.SYSTEM}Error: OPENROUTER_API_KEY not found in environment variables. Please set one for browser tasks.{TermColors.ENDC}")
         else:
             config = Config()
             assistant = VoiceAssistant(config)
