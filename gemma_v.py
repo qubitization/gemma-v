@@ -1,3 +1,4 @@
+# gemma_v.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -19,6 +20,7 @@ import multiprocessing as mp
 from pynput import keyboard
 from typing import List, Dict, Coroutine
 import asyncio
+from enum import Enum, auto
 
 # --- ASR and VLM/LLM Imports ---
 from parakeet_mlx import from_pretrained
@@ -52,7 +54,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - (%(threadName)-10s) - %(message)s')
 root = logging.getLogger()
 for h in root.handlers:
-    h.setLevel(logging.INFO) # Set to INFO to see the new monitor logs
+    h.setLevel(logging.INFO)
 
 # --- System Prompt for Intent Routing ---
 SYSTEM_PROMPT = r"""You are a highly specialized AI assistant that functions as an intent router. Your primary task is to analyze the user's prompt and respond with a single JSON object that classifies the user's intent and contains the appropriate response.
@@ -117,6 +119,17 @@ class Config:
     NLU_MODEL_PATH = "mlx-community/gemma-3n-E2B-it-lm-4bit"
     MAX_KV_SIZE = 4096 * 4
 
+# =================================================================
+# 0.5. STATE MACHINE DEFINITION (PRODUCTION-GRADE REFACTOR)
+# =================================================================
+class AssistantState(Enum):
+    """Defines the possible states of the voice assistant for robust state management."""
+    IDLE = auto()              # Waiting for user to speak
+    LISTENING = auto()         # Actively recording and transcribing user speech (managed by ASR)
+    THINKING = auto()          # Awaiting response from the LLM
+    SPEAKING = auto()          # Streaming LLM response to TTS
+    BUSY_BROWSER = auto()      # Executing a browser task
+    
 def common_prefix_len(list1: List, list2: List) -> int:
     min_len = min(len(list1), len(list2))
     for i in range(min_len):
@@ -225,6 +238,7 @@ class StreamingTTSEngine:
 
             try:
                 for token in text_generator:
+                    if barge_in_event.is_set(): break
                     clean_token = token.replace("<eos>", "").replace("*", "")
                     sentence_buffer += clean_token
                     print_buffer.append(clean_token)
@@ -262,10 +276,11 @@ class StreamingTTSEngine:
                 logging.error(f"Error in feeder: {e}", exc_info=True)
             finally:
                 generation_done_event.set()
+                print()
                 if barge_in_event.is_set():
                     self.interrupt()
-                print()
-                logging.info("="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
+                # The "waiting for command" message is now handled by the main state machine
+                # logging.info("="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
 
         threading.Thread(target=llm_to_tts_feeder, daemon=True, name="LLM-TTS-Feeder").start()
 
@@ -540,8 +555,10 @@ class GemmaChatEngine:
                 return {"intent": "browseruse", "payload": final_payload}
 
 class KeyPressListener:
-    def __init__(self, is_replying_event: threading.Event, barge_in_event: threading.Event, video_is_playing_event: threading.Event, go_home_event: threading.Event):
-        self.is_replying_event = is_replying_event
+    def __init__(self, assistant: 'VoiceAssistant', barge_in_event: threading.Event, video_is_playing_event: threading.Event, go_home_event: threading.Event):
+        # This listener now gets a reference to the main assistant to check its state,
+        # which is more robust than relying on a separate event.
+        self.assistant = assistant
         self.barge_in_event = barge_in_event
         self.video_is_playing_event = video_is_playing_event
         self.go_home_event = go_home_event
@@ -549,18 +566,21 @@ class KeyPressListener:
 
     def _on_press(self, key):
         if key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
+            current_state = self.assistant.state # Get current state directly
+
             # If a video is playing, the Command key's job is to trigger the "Reset & Ready" action.
             if self.video_is_playing_event.is_set():
                 logging.info("Command key pressed during video playback. Signaling 'Reset & Ready'.")
                 print(f"\n{TermColors.SYSTEM}Reset command received. Stopping task and returning to home...{TermColors.ENDC}")
                 self.go_home_event.set()
 
-            # If the assistant is speaking (but not in a video task), Command key is a barge-in.
-            elif self.is_replying_event.is_set():
-                logging.info("Command key pressed during TTS. Signaling BARGE-IN.")
+            # The barge-in logic is now simpler and more robust.
+            # Any 'thinking' or 'speaking' state is interruptible.
+            elif current_state in [AssistantState.THINKING, AssistantState.SPEAKING]:
+                logging.info(f"Command key pressed during {current_state.name}. Signaling BARGE-IN.")
                 print(f"\n{TermColors.SYSTEM}Barge-in activated. Silenced.{TermColors.ENDC}")
                 self.barge_in_event.set()
-
+                
     def start(self):
         if self.listener is None:
             self.listener = keyboard.Listener(on_press=self._on_press)
@@ -633,7 +653,6 @@ class BrowserController:
                 logging.info("[URL Monitor] Monitor task was successfully cancelled.")
         self.monitor_task = None
 
-    # --- MODIFIED: The monitor is now resilient to initialization race conditions ---
     async def _monitor_video_state(self):
         logging.info("[URL Monitor] Persistent monitor started.")
         while not self._monitor_stop_event.is_set():
@@ -701,7 +720,7 @@ class BrowserController:
             await self.initialize_session()
 
             llm = ChatOpenAI(
-                model='google/gemini-2.5-flash-lite',
+                model='google/gemini-2.5-flash-lite-preview-06-17',
                 base_url='https://openrouter.ai/api/v1',
                 api_key=os.getenv('OPENROUTER_API_KEY'),
             )
@@ -769,22 +788,41 @@ class BrowserController:
 class VoiceAssistant:
     def __init__(self, config: Config):
         self.config = config
+
+        # --- State Management (Refactored for Robustness) ---
+        self.state = AssistantState.IDLE
+        self.state_lock = threading.Lock()
+
+        # --- Events for Component Synchronization ---
         self.tts_is_speaking_event = mp.Event()
-        self.barge_in_event = threading.Event()
-        self.is_replying_event = threading.Event()
+        self.barge_in_event = threading.Event() # Global interrupt signal
         self.video_is_playing_event = threading.Event()
         self.go_home_event = threading.Event()
 
+        # --- Core Components ---
         self.gemma = GemmaChatEngine(config)
         self.tts = StreamingTTSEngine(config, self.tts_is_speaking_event)
         self.transcriber = StreamingTranscriber(config, self.tts_is_speaking_event, self.barge_in_event, self.video_is_playing_event)
-        self.key_listener = KeyPressListener(self.is_replying_event, self.barge_in_event, self.video_is_playing_event, self.go_home_event)
+        # Key listener is now passed a reference to the assistant itself to query its state.
+        self.key_listener = KeyPressListener(self, self.barge_in_event, self.video_is_playing_event, self.go_home_event)
         self.browser_controller = BrowserController(self.tts, self.video_is_playing_event)
-        self.browser_task_thread: threading.Thread | None = None
         
+        # --- Threading and Asyncio Management ---
+        self.browser_task_thread: threading.Thread | None = None
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.asyncio_thread: threading.Thread | None = None
         self.loop_is_ready = threading.Event()
+        
+        # --- Temporary state for ongoing generations ---
+        self.generation_done_event = None
+        self.response_generator = None
+
+    def set_state(self, new_state: AssistantState):
+        """Thread-safe method to change the assistant's state and log the change."""
+        with self.state_lock:
+            if self.state != new_state:
+                logging.info(f"State changed from {self.state.name} to {new_state.name}")
+                self.state = new_state
 
     def _start_asyncio_loop(self):
         logging.info("Starting asyncio event loop thread.")
@@ -818,28 +856,23 @@ class VoiceAssistant:
 
             if self.video_is_playing_event.is_set():
                 logging.info("Browser thread entered post-task monitoring. Waiting for 'Go Home' signal or navigation away.")
-                # This loop keeps the thread alive, polling for two conditions to exit:
-                # 1. The user presses Command (go_home_event is set).
-                # 2. The user manually navigates away from the video (video_is_playing_event is cleared by the URL monitor).
                 while self.video_is_playing_event.is_set():
                     if self.go_home_event.is_set():
                         logging.info("Go home event received during post-task monitoring. Navigating home.")
-                        # Since we are in the correct thread, we can now safely issue the command to go home.
                         self._submit_coro_and_wait(self.browser_controller._navigate_to_home())
                         self.tts.play_greeting("Okay, I've reset the browser.")
-                        break  # Exit the monitoring loop to allow the thread to finish.
+                        break
                     time.sleep(0.1)
 
         except Exception as e:
             logging.error(f"Error running browser task thread: {e}", exc_info=True)
         finally:
-            if self.video_is_playing_event.is_set():
-                self.video_is_playing_event.clear()
-
+            if self.video_is_playing_event.is_set(): self.video_is_playing_event.clear()
             self.go_home_event.clear()
             logging.info("Browser task thread finished. Assistant is ready for new commands.")
 
     def run(self):
+        """Main entry point. Runs the state-driven loop of the voice assistant."""
         self.asyncio_thread = threading.Thread(target=self._start_asyncio_loop, name="Asyncio-Loop-Thread", daemon=True)
         self.asyncio_thread.start()
         self.loop_is_ready.wait()
@@ -851,52 +884,80 @@ class VoiceAssistant:
 
         try:
             while True:
-                if self.browser_task_thread and not self.browser_task_thread.is_alive():
-                    logging.info("Detected finished browser thread. Joining it to clean up.")
-                    self.browser_task_thread.join()
-                    self.browser_task_thread = None
-                    logging.info("Browser thread joined. State is now free.")
+                time.sleep(0.05) # Prevent busy-waiting
 
-                try:
-                    final_transcript = self.transcriber.final_transcript_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-
-                logging.info(f"Orchestrator received: '{final_transcript}'")
-
-                if self.browser_task_thread and self.browser_task_thread.is_alive():
-                    if not self.video_is_playing_event.is_set():
-                        self.tts.play_greeting("Please wait, I'm currently busy with a browser task.")
-                    continue
-
-                self.is_replying_event.set()
-                try:
-                    if "goodbye" in final_transcript.lower():
-                        self.tts.play_greeting("Goodbye!"); time.sleep(2); break
-                    if "reset conversation" in final_transcript.lower():
-                        self.gemma.reset(); self.tts.play_greeting("History cleared."); continue
-
-                    generation_done_event = threading.Event()
-                    response_generator = GeneratorWithReturnValue(self.gemma.stream_intent_and_response(final_transcript, self.barge_in_event))
-                    self.tts.speak(iter(response_generator), self.barge_in_event, generation_done_event)
-                    generation_done_event.wait()
-                    
-                    while self.tts.sentence_queue and not self.tts.sentence_queue.empty(): time.sleep(0.1)
-                    while self.tts_is_speaking_event.is_set(): time.sleep(0.1)
-
-                    if self.barge_in_event.is_set(): self.tts.interrupt()
-
-                    result = response_generator.return_value
-                    if result and result.get("intent") == "browseruse":
-                        payload = result.get("payload", "")
-                        self.browser_task_thread = threading.Thread(
-                            target=self._handle_browser_task, args=(payload,), name="Browser-Task-Thread"
-                        )
-                        self.browser_task_thread.start()
-                finally:
+                # --- Global Interrupt Check (First Priority) ---
+                if self.barge_in_event.is_set():
+                    self.tts.interrupt()
                     self.barge_in_event.clear()
-                    self.is_replying_event.clear()
+                    # Clean up any turn-specific data
+                    self.response_generator = None
+                    self.generation_done_event = None
+                    self.set_state(AssistantState.IDLE)
+                    with self.transcriber.final_transcript_queue.mutex:
+                        self.transcriber.final_transcript_queue.queue.clear()
+                    print("\n" + "="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
+                    continue
 
+                # --- State-driven Main Loop ---
+                if self.state == AssistantState.IDLE:
+                    try:
+                        # Join any finished browser thread before accepting new input
+                        if self.browser_task_thread and not self.browser_task_thread.is_alive():
+                            self.browser_task_thread.join()
+                            self.browser_task_thread = None
+                            logging.info("Browser thread joined. Assistant is ready for new commands.")
+
+                        # Atomically get and start processing the transcript in one go
+                        final_transcript = self.transcriber.final_transcript_queue.get_nowait()
+                        logging.info(f"Orchestrator received: '{final_transcript}'")
+                        
+                        if "goodbye" in final_transcript.lower():
+                            self.tts.play_greeting("Goodbye!"); time.sleep(2); break
+                        elif "reset conversation" in final_transcript.lower():
+                            self.gemma.reset(); self.tts.play_greeting("History cleared.")
+                        elif self.browser_task_thread and self.browser_task_thread.is_alive():
+                            if not self.video_is_playing_event.is_set():
+                                self.tts.play_greeting("Please wait, I'm currently busy with a browser task.")
+                        else:
+                            # Transition to THINKING and immediately start the process
+                            self.set_state(AssistantState.THINKING)
+                            self.generation_done_event = threading.Event()
+                            self.response_generator = GeneratorWithReturnValue(self.gemma.stream_intent_and_response(final_transcript, self.barge_in_event))
+                            self.tts.speak(iter(self.response_generator), self.barge_in_event, self.generation_done_event)
+                            self.set_state(AssistantState.SPEAKING)
+
+                    except queue.Empty:
+                        continue # Nothing to do, stay in IDLE
+
+                elif self.state == AssistantState.SPEAKING:
+                    if not self.generation_done_event or self.generation_done_event.is_set():
+                        queue_is_empty = (not self.tts.sentence_queue) or self.tts.sentence_queue.empty()
+                        speaking_is_done = not self.tts_is_speaking_event.is_set()
+
+                        if queue_is_empty and speaking_is_done:
+                            # The entire response turn is complete.
+                            result = self.response_generator.return_value if self.response_generator else None
+                            
+                            # Clean up turn-specific variables
+                            self.response_generator = None
+                            self.generation_done_event = None
+
+                            if result and result.get("intent") == "browseruse":
+                                payload = result.get("payload", "")
+                                self.browser_task_thread = threading.Thread(
+                                    target=self._handle_browser_task, args=(payload,), name="Browser-Task-Thread"
+                                )
+                                self.browser_task_thread.start()
+                                self.set_state(AssistantState.BUSY_BROWSER)
+                            else:
+                                logging.info("="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
+                                self.set_state(AssistantState.IDLE)
+                
+                elif self.state == AssistantState.BUSY_BROWSER:
+                    if not self.browser_task_thread or not self.browser_task_thread.is_alive():
+                        self.set_state(AssistantState.IDLE)
+        
         except KeyboardInterrupt: logging.info("Caught KeyboardInterrupt.")
         finally:
             self.shutdown()
