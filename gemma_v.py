@@ -142,10 +142,15 @@ def common_prefix_len(list1: List, list2: List) -> int:
 # =================================================================
 
 class TTSProcessWorker(mp.Process):
-    def __init__(self, sentence_queue: mp.JoinableQueue, config_dict: dict, interrupt_event: mp.Event, tts_is_speaking_event: mp.Event):
+    """
+    A persistent worker process for TTS that loads the model only once.
+    It can be interrupted via an mp.Event without being terminated.
+    """
+    # CLARITY: Renamed interrupt_event to tts_stop_signal
+    def __init__(self, sentence_queue: mp.JoinableQueue, config_dict: dict, tts_stop_signal: mp.Event, tts_is_speaking_event: mp.Event):
         super().__init__()
         self.sentence_queue = sentence_queue
-        self.interrupt_event = interrupt_event
+        self.tts_stop_signal = tts_stop_signal
         self.tts_is_speaking_event = tts_is_speaking_event
         self.model_path = config_dict.get('PIPER_MODEL_PATH')
         self.length_scale = config_dict.get('PIPER_LENGTH_SCALE')
@@ -161,71 +166,102 @@ class TTSProcessWorker(mp.Process):
             logging.info("[TTS Process] Loading Piper voice model...")
             voice = PiperVoice.load(self.model_path)
             syn_config = SynthesisConfig(length_scale=self.length_scale, noise_scale=self.noise_scale, noise_w_scale=self.noise_w_scale)
-            logging.info("[TTS Process] Piper model loaded successfully.")
+            logging.info("[TTS Process] Piper model loaded successfully. Worker is now persistent.")
         except Exception as e:
             logging.critical(f"[TTS Process] Failed to load Piper model: {e}", exc_info=True)
             return
 
         while True:
             try:
-                if self.interrupt_event.is_set():
+                # CLARITY: Using the new, clearer name
+                if self.tts_stop_signal.is_set():
                     while not self.sentence_queue.empty():
                         try: self.sentence_queue.get_nowait(); self.sentence_queue.task_done()
                         except queue.Empty: break
                     time.sleep(0.1)
                     continue
+
                 sentence = self.sentence_queue.get()
                 sentence = sentence.rstrip('"}')
-                if sentence is None: break
-                if self.interrupt_event.is_set() or not sentence.strip():
+                if sentence is None:
+                    break
+                
+                if self.tts_stop_signal.is_set() or not sentence.strip():
                     self.sentence_queue.task_done()
                     continue
+
                 try:
                     self.tts_is_speaking_event.set()
                     with sd.RawOutputStream(samplerate=voice.config.sample_rate, channels=1, dtype="int16") as stream:
                         logging.info(f"[TTS Process] Synthesizing sentence: '{sentence}'")
                         for chunk in voice.synthesize(sentence, syn_config=syn_config):
-                            if self.interrupt_event.is_set():
-                                stream.abort(ignore_errors=True); break
+                            if self.tts_stop_signal.is_set():
+                                logging.info("[TTS Process] TTS stop signal detected during synthesis. Aborting stream.")
+                                stream.abort(ignore_errors=True)
+                                break
                             stream.write(chunk.audio_int16_bytes)
-                except Exception as e: logging.error(f"[TTS Process] Error during synthesis: {e}")
-                finally: self.tts_is_speaking_event.clear()
+                except Exception as e: 
+                    logging.error(f"[TTS Process] Error during synthesis: {e}")
+                finally:
+                    self.tts_is_speaking_event.clear()
+
                 self.sentence_queue.task_done()
-            except queue.Empty: continue
+            except queue.Empty:
+                continue
             except Exception as e:
                 logging.error(f"[TTS Process] Error in run loop: {e}", exc_info=True)
                 self.tts_is_speaking_event.clear()
+        
+        logging.info("[TTS Process] Shutdown signal received. Exiting gracefully.")
 
 class StreamingTTSEngine:
     def __init__(self, config: Config, tts_is_speaking_event: mp.Event):
-        self.config = config; self.sentence_queue = None; self.tts_process = None
-        self.interrupt_event = mp.Event(); self.tts_is_speaking_event = tts_is_speaking_event
+        self.config = config
+        self.sentence_queue = None
+        self.tts_process = None
+        # CLARITY: Renamed interrupt_event to tts_stop_signal
+        self.tts_stop_signal = mp.Event() 
+        self.tts_is_speaking_event = tts_is_speaking_event
 
     def _start_worker_if_needed(self):
         if self.tts_process is None or not self.tts_process.is_alive():
-            logging.info("Starting new TTS worker process...")
-            if self.tts_process: self.tts_process.join(timeout=0.1)
-            self.sentence_queue = mp.JoinableQueue(); self.interrupt_event.clear(); self.tts_is_speaking_event.clear()
+            logging.info("Starting new persistent TTS worker process...")
+            if self.tts_process: 
+                self.tts_process.join(timeout=0.1)
+            
+            self.sentence_queue = mp.JoinableQueue()
+            self.tts_stop_signal.clear()
+            self.tts_is_speaking_event.clear()
+            
             config_dict = {k: v for k, v in self.config.__class__.__dict__.items() if not k.startswith('_') and not callable(v)}
             if not config_dict.get('PIPER_MODEL_PATH') or not Path(config_dict['PIPER_MODEL_PATH']).exists():
                 logging.critical("Cannot start TTS worker: PIPER_MODEL_PATH is not set or file does not exist.")
-                self.tts_process = None; return
-            self.tts_process = TTSProcessWorker(self.sentence_queue, config_dict, self.interrupt_event, self.tts_is_speaking_event)
+                self.tts_process = None
+                return
+            
+            self.tts_process = TTSProcessWorker(self.sentence_queue, config_dict, self.tts_stop_signal, self.tts_is_speaking_event)
             self.tts_process.start()
 
     def interrupt(self):
-        logging.info("[TTS Controller] INTERRUPT: Terminating TTS worker process.")
-        if self.tts_process and self.tts_process.is_alive():
-            self.tts_process.terminate(); self.tts_process.join(timeout=1.0)
-        self.tts_process = None; self.sentence_queue = None; self.tts_is_speaking_event.clear()
+        logging.info("[TTS Controller] INTERRUPT: Signaling TTS worker to stop and clear queue.")
+        self.tts_stop_signal.set()
+        self.tts_is_speaking_event.clear()
+        
+        if self.sentence_queue:
+            while not self.sentence_queue.empty():
+                try: self.sentence_queue.get_nowait()
+                except queue.Empty: break
 
-    def speak(self, text_generator, barge_in_event: threading.Event, generation_done_event: threading.Event):
+    # CLARITY: Renamed barge_in_event to user_interrupt_request
+    def speak(self, text_generator, user_interrupt_request: threading.Event, generation_done_event: threading.Event):
         self._start_worker_if_needed()
         if not self.tts_process:
             print("\nAssistant: [TTS Error]")
             for _ in text_generator: pass
             generation_done_event.set()
             return
+
+        self.tts_stop_signal.clear()
 
         def llm_to_tts_feeder():
             sentence_buffer = ""
@@ -238,7 +274,8 @@ class StreamingTTSEngine:
 
             try:
                 for token in text_generator:
-                    if barge_in_event.is_set(): break
+                    if user_interrupt_request.is_set():
+                        break
                     clean_token = token.replace("<eos>", "").replace("*", "")
                     sentence_buffer += clean_token
                     print_buffer.append(clean_token)
@@ -254,20 +291,21 @@ class StreamingTTSEngine:
                                     try:
                                         self.sentence_queue.put(s.strip(), timeout=0.5)
                                     except queue.Full:
-                                        logging.warning("TTS queue full, likely due to barge-in. Halting feeder.")
-                                        barge_in_event.set()
+                                        logging.warning("TTS queue full, likely due to user interrupt. Halting feeder.")
+                                        user_interrupt_request.set()
                                         break
                                 else:
-                                    barge_in_event.set()
+                                    user_interrupt_request.set()
                                     break
-                        if barge_in_event.is_set():
+                        if user_interrupt_request.is_set():
                             break
 
-                if not barge_in_event.is_set():
+                # BUGFIX: This block is now robust against race conditions
+                if not user_interrupt_request.is_set():
                     final_text_to_print = "".join(print_buffer).rstrip(unwanted_suffix)
                     print(final_text_to_print, end="", flush=True)
 
-                if not barge_in_event.is_set() and (last_sentence := sentence_buffer.strip()):
+                if not user_interrupt_request.is_set() and (last_sentence := sentence_buffer.strip()):
                     if self.sentence_queue and self.tts_process and self.tts_process.is_alive():
                         clean_last_sentence = last_sentence.rstrip('"}\n```')
                         self.sentence_queue.put(clean_last_sentence)
@@ -277,29 +315,39 @@ class StreamingTTSEngine:
             finally:
                 generation_done_event.set()
                 print()
-                if barge_in_event.is_set():
-                    self.interrupt()
-                # The "waiting for command" message is now handled by the main state machine
-                # logging.info("="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
-
+                
         threading.Thread(target=llm_to_tts_feeder, daemon=True, name="LLM-TTS-Feeder").start()
 
-    def shutdown(self): self.interrupt()
+    def shutdown(self):
+        logging.info("[TTS Controller] SHUTDOWN: Terminating TTS worker process.")
+        if self.tts_process and self.tts_process.is_alive():
+            if self.sentence_queue:
+                self.sentence_queue.put(None)
+            self.tts_process.join(timeout=2.0)
+            if self.tts_process.is_alive():
+                logging.warning("[TTS Controller] TTS process did not shut down gracefully. Terminating.")
+                self.tts_process.terminate()
+                self.tts_process.join(timeout=1.0)
+        self.tts_process = None
+        self.sentence_queue = None
 
     def play_greeting(self, text: str):
         self._start_worker_if_needed()
         if not self.tts_process:
             print(f"\nAssistant: {text}\n")
             return
+        
+        self.tts_stop_signal.clear()
         if self.sentence_queue:
             self.sentence_queue.put(text)
 
 class StreamingTranscriber:
-    def __init__(self, config: Config, tts_is_speaking_event: mp.Event, barge_in_event: threading.Event, video_is_playing_event: threading.Event):
+    # CLARITY: Renamed barge_in_event to user_interrupt_request
+    def __init__(self, config: Config, tts_is_speaking_event: mp.Event, user_interrupt_request: threading.Event, video_is_playing_event: threading.Event):
         logging.info("Initializing Streaming Transcriber with Parakeet...")
         self.config = config
         self.tts_is_speaking_event = tts_is_speaking_event
-        self.barge_in_event = barge_in_event
+        self.user_interrupt_request = user_interrupt_request
         self.video_is_playing_event = video_is_playing_event
 
         self._load_asr_model()
@@ -362,7 +410,6 @@ class StreamingTranscriber:
 
         while self._is_running:
             try:
-                # Pause ASR if a video is playing in the browser
                 if self.video_is_playing_event.is_set():
                     if not self.was_video_playing_prev_iter:
                         logging.info("ASR paused for video playback.")
@@ -377,16 +424,16 @@ class StreamingTranscriber:
                     logging.info("ASR resumed after video playback.")
                 self.was_video_playing_prev_iter = False
 
-                if self.barge_in_event.is_set():
+                if self.user_interrupt_request.is_set():
                     with self.audio_queue.mutex: self.audio_queue.queue.clear()
                     vad_process_buffer = np.array([], dtype=np.float32)
                     asr_audio_buffer = np.array([], dtype=np.float32)
                     self._reset_asr_state()
                     last_printed_text = ""
-                    logging.info("ASR worker state reset due to barge-in.")
-                    while self.barge_in_event.is_set():
+                    logging.info("ASR worker state reset due to user interrupt.")
+                    while self.user_interrupt_request.is_set():
                         time.sleep(0.1)
-                    logging.info("ASR worker resuming after barge-in signal cleared.")
+                    logging.info("ASR worker resuming after user interrupt signal cleared.")
                     continue
 
                 if self.tts_is_speaking_event.is_set():
@@ -500,7 +547,8 @@ class GemmaChatEngine:
         if self.is_llm:
             self.processed_tokens = []; self.prompt_cache = make_prompt_cache(self.model, self.config.MAX_KV_SIZE)
 
-    def stream_intent_and_response(self, transcript: str, barge_in_event: threading.Event):
+    # CLARITY: Renamed barge_in_event to user_interrupt_request
+    def stream_intent_and_response(self, transcript: str, user_interrupt_request: threading.Event):
         if not transcript: return
         self.messages.append({"role": "user", "content": transcript})
         if self.is_llm:
@@ -523,8 +571,8 @@ class GemmaChatEngine:
         payload_marker_re = re.compile(r'"output"\s*:\s*"')
         try:
             for token_text in token_generator:
-                if barge_in_event.is_set():
-                    logging.info("Barge-in detected in Gemma Engine, halting generation."); break
+                if user_interrupt_request.is_set():
+                    logging.info("User interrupt detected in Gemma Engine, halting generation."); break
                 full_response_parts.append(token_text)
                 if not payload_started:
                     buffer += token_text
@@ -544,8 +592,8 @@ class GemmaChatEngine:
         finally:
             gc.collect()
             full_response_text = "".join(full_response_parts).replace("<eos>", "").strip()
-            if barge_in_event.is_set():
-                logging.info("Barge-in: Not saving partial model response. Removing user prompt from history.")
+            if user_interrupt_request.is_set():
+                logging.info("User interrupt: Not saving partial model response. Removing user prompt from history.")
                 if self.messages and self.messages[-1]["role"] == "user": self.messages.pop()
             elif full_response_text:
                 self.messages.append({"role": "model", "content": full_response_text})
@@ -555,31 +603,27 @@ class GemmaChatEngine:
                 return {"intent": "browseruse", "payload": final_payload}
 
 class KeyPressListener:
-    def __init__(self, assistant: 'VoiceAssistant', barge_in_event: threading.Event, video_is_playing_event: threading.Event, go_home_event: threading.Event):
-        # This listener now gets a reference to the main assistant to check its state,
-        # which is more robust than relying on a separate event.
+    # CLARITY: Renamed barge_in_event to user_interrupt_request
+    def __init__(self, assistant: 'VoiceAssistant', user_interrupt_request: threading.Event, video_is_playing_event: threading.Event, go_home_event: threading.Event):
         self.assistant = assistant
-        self.barge_in_event = barge_in_event
+        self.user_interrupt_request = user_interrupt_request
         self.video_is_playing_event = video_is_playing_event
         self.go_home_event = go_home_event
         self.listener = None
 
     def _on_press(self, key):
         if key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
-            current_state = self.assistant.state # Get current state directly
+            current_state = self.assistant.state
 
-            # If a video is playing, the Command key's job is to trigger the "Reset & Ready" action.
             if self.video_is_playing_event.is_set():
                 logging.info("Command key pressed during video playback. Signaling 'Reset & Ready'.")
                 print(f"\n{TermColors.SYSTEM}Reset command received. Stopping task and returning to home...{TermColors.ENDC}")
                 self.go_home_event.set()
 
-            # The barge-in logic is now simpler and more robust.
-            # Any 'thinking' or 'speaking' state is interruptible.
             elif current_state in [AssistantState.THINKING, AssistantState.SPEAKING]:
-                logging.info(f"Command key pressed during {current_state.name}. Signaling BARGE-IN.")
-                print(f"\n{TermColors.SYSTEM}Barge-in activated. Silenced.{TermColors.ENDC}")
-                self.barge_in_event.set()
+                logging.info(f"Command key pressed during {current_state.name}. Signaling USER INTERRUPT.")
+                print(f"\n{TermColors.SYSTEM}User interrupt activated. Silenced.{TermColors.ENDC}")
+                self.user_interrupt_request.set()
                 
     def start(self):
         if self.listener is None:
@@ -657,7 +701,6 @@ class BrowserController:
         logging.info("[URL Monitor] Persistent monitor started.")
         while not self._monitor_stop_event.is_set():
             try:
-                # Check for connection readiness
                 if self.browser_session and await self.browser_session.is_connected():
                     page = await self.browser_session.get_current_page()
                     url = page.url
@@ -667,16 +710,15 @@ class BrowserController:
                     if is_video_page and not event_is_set:
                         logging.info(f"[URL Monitor] YouTube video page detected ({url}). Setting video_is_playing_event.")
                         self.video_is_playing_event.set()
-
                     elif not is_video_page and event_is_set:
                         logging.info(f"[URL Monitor] No longer on a video page. Clearing video_is_playing_event.")
                         self.video_is_playing_event.clear()
                 else:
                     logging.warning("[URL Monitor] Browser session not ready yet. Waiting...")
-                    await asyncio.sleep(1.0) # Wait for 1 second before checking again
-                    continue # Continue to the next loop iteration
+                    await asyncio.sleep(1.0)
+                    continue
 
-                await asyncio.sleep(1.0) # Check every second
+                await asyncio.sleep(1.0)
 
             except asyncio.CancelledError:
                 logging.info("[URL Monitor] Monitor loop was cancelled.")
@@ -690,9 +732,7 @@ class BrowserController:
             logging.info("[URL Monitor] Monitor stopping, ensuring video_is_playing_event is cleared.")
         logging.info("[URL Monitor] Persistent monitor stopped.")
 
-
     async def _navigate_to_home(self):
-        """Navigates the current browser page to the site's base URL."""
         if self.browser_session and await self.browser_session.is_connected():
             try:
                 logging.info("Navigating to base URL.")
@@ -713,8 +753,7 @@ class BrowserController:
         logging.info(f"Starting browser task: {task}")
         self.tts.play_greeting("Okay, on it. This might take a moment.")
         
-        agent_task = None
-        watcher_task = None
+        agent_task = None; watcher_task = None
 
         try:
             await self.initialize_session()
@@ -772,10 +811,8 @@ class BrowserController:
             for t in {agent_task, watcher_task}:
                 if t and not t.done():
                     t.cancel()
-                    try:
-                        await t
-                    except asyncio.CancelledError:
-                        logging.info(f"Task '{t.get_name()}' was cancelled successfully.")
+                    try: await t
+                    except asyncio.CancelledError: logging.info(f"Task '{t.get_name()}' was cancelled successfully.")
             logging.info("Agent task lifecycle has ended.")
 
     async def shutdown(self):
@@ -789,36 +826,30 @@ class VoiceAssistant:
     def __init__(self, config: Config):
         self.config = config
 
-        # --- State Management (Refactored for Robustness) ---
         self.state = AssistantState.IDLE
         self.state_lock = threading.Lock()
 
-        # --- Events for Component Synchronization ---
         self.tts_is_speaking_event = mp.Event()
-        self.barge_in_event = threading.Event() # Global interrupt signal
+        # CLARITY: Renamed barge_in_event to user_interrupt_request
+        self.user_interrupt_request = threading.Event()
         self.video_is_playing_event = threading.Event()
         self.go_home_event = threading.Event()
 
-        # --- Core Components ---
         self.gemma = GemmaChatEngine(config)
         self.tts = StreamingTTSEngine(config, self.tts_is_speaking_event)
-        self.transcriber = StreamingTranscriber(config, self.tts_is_speaking_event, self.barge_in_event, self.video_is_playing_event)
-        # Key listener is now passed a reference to the assistant itself to query its state.
-        self.key_listener = KeyPressListener(self, self.barge_in_event, self.video_is_playing_event, self.go_home_event)
+        self.transcriber = StreamingTranscriber(config, self.tts_is_speaking_event, self.user_interrupt_request, self.video_is_playing_event)
+        self.key_listener = KeyPressListener(self, self.user_interrupt_request, self.video_is_playing_event, self.go_home_event)
         self.browser_controller = BrowserController(self.tts, self.video_is_playing_event)
         
-        # --- Threading and Asyncio Management ---
         self.browser_task_thread: threading.Thread | None = None
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.asyncio_thread: threading.Thread | None = None
         self.loop_is_ready = threading.Event()
         
-        # --- Temporary state for ongoing generations ---
         self.generation_done_event = None
         self.response_generator = None
 
     def set_state(self, new_state: AssistantState):
-        """Thread-safe method to change the assistant's state and log the change."""
         with self.state_lock:
             if self.state != new_state:
                 logging.info(f"State changed from {self.state.name} to {new_state.name}")
@@ -851,8 +882,7 @@ class VoiceAssistant:
                 self.browser_controller.run_browser_task(task, self.go_home_event)
             )
 
-            if self.go_home_event.is_set():
-                return
+            if self.go_home_event.is_set(): return
 
             if self.video_is_playing_event.is_set():
                 logging.info("Browser thread entered post-task monitoring. Waiting for 'Go Home' signal or navigation away.")
@@ -872,7 +902,6 @@ class VoiceAssistant:
             logging.info("Browser task thread finished. Assistant is ready for new commands.")
 
     def run(self):
-        """Main entry point. Runs the state-driven loop of the voice assistant."""
         self.asyncio_thread = threading.Thread(target=self._start_asyncio_loop, name="Asyncio-Loop-Thread", daemon=True)
         self.asyncio_thread.start()
         self.loop_is_ready.wait()
@@ -884,13 +913,12 @@ class VoiceAssistant:
 
         try:
             while True:
-                time.sleep(0.05) # Prevent busy-waiting
+                time.sleep(0.05)
 
-                # --- Global Interrupt Check (First Priority) ---
-                if self.barge_in_event.is_set():
+                if self.user_interrupt_request.is_set():
                     self.tts.interrupt()
-                    self.barge_in_event.clear()
-                    # Clean up any turn-specific data
+                    self.user_interrupt_request.clear()
+                    
                     self.response_generator = None
                     self.generation_done_event = None
                     self.set_state(AssistantState.IDLE)
@@ -899,16 +927,13 @@ class VoiceAssistant:
                     print("\n" + "="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
                     continue
 
-                # --- State-driven Main Loop ---
                 if self.state == AssistantState.IDLE:
                     try:
-                        # Join any finished browser thread before accepting new input
                         if self.browser_task_thread and not self.browser_task_thread.is_alive():
                             self.browser_task_thread.join()
                             self.browser_task_thread = None
                             logging.info("Browser thread joined. Assistant is ready for new commands.")
 
-                        # Atomically get and start processing the transcript in one go
                         final_transcript = self.transcriber.final_transcript_queue.get_nowait()
                         logging.info(f"Orchestrator received: '{final_transcript}'")
                         
@@ -920,15 +945,14 @@ class VoiceAssistant:
                             if not self.video_is_playing_event.is_set():
                                 self.tts.play_greeting("Please wait, I'm currently busy with a browser task.")
                         else:
-                            # Transition to THINKING and immediately start the process
                             self.set_state(AssistantState.THINKING)
                             self.generation_done_event = threading.Event()
-                            self.response_generator = GeneratorWithReturnValue(self.gemma.stream_intent_and_response(final_transcript, self.barge_in_event))
-                            self.tts.speak(iter(self.response_generator), self.barge_in_event, self.generation_done_event)
+                            self.response_generator = GeneratorWithReturnValue(self.gemma.stream_intent_and_response(final_transcript, self.user_interrupt_request))
+                            self.tts.speak(iter(self.response_generator), self.user_interrupt_request, self.generation_done_event)
                             self.set_state(AssistantState.SPEAKING)
 
                     except queue.Empty:
-                        continue # Nothing to do, stay in IDLE
+                        continue
 
                 elif self.state == AssistantState.SPEAKING:
                     if not self.generation_done_event or self.generation_done_event.is_set():
@@ -936,10 +960,8 @@ class VoiceAssistant:
                         speaking_is_done = not self.tts_is_speaking_event.is_set()
 
                         if queue_is_empty and speaking_is_done:
-                            # The entire response turn is complete.
                             result = self.response_generator.return_value if self.response_generator else None
                             
-                            # Clean up turn-specific variables
                             self.response_generator = None
                             self.generation_done_event = None
 
@@ -964,7 +986,7 @@ class VoiceAssistant:
 
     def shutdown(self):
         print("\nShutting down...")
-        self.barge_in_event.set()
+        self.user_interrupt_request.set()
         self.go_home_event.set()
         
         self.key_listener.stop()
