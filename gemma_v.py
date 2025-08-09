@@ -182,9 +182,9 @@ class TTSProcessWorker(mp.Process):
                     continue
 
                 sentence = self.sentence_queue.get()
-                sentence = sentence.rstrip('"}')
                 if sentence is None:
                     break
+                sentence = sentence.rstrip('"}')
                 
                 if self.tts_stop_signal.is_set() or not sentence.strip():
                     self.sentence_queue.task_done()
