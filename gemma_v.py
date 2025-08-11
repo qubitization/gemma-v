@@ -382,7 +382,7 @@ class StreamingTranscriber:
         self._worker_thread = None
         self.speech_triggered = False
         self.silence_chunks_counter = 0
-        self.was_paused_in_prev_iter = False # 【优化】用于减少日志噪音
+        self.was_paused_in_prev_iter = False 
 
     def _load_asr_model(self):
         logging.info(f"Loading Parakeet ASR model: {self.config.ASR_MODEL_REPO}")
@@ -415,20 +415,16 @@ class StreamingTranscriber:
         else:
             self.transcriber = None
 
-    # 【优化】新增的辅助方法，用于集中管理所有暂停逻辑
     def _should_pause_processing(self) -> bool:
         """
         Determines if the ASR processing should be paused.
         This is the single source of truth for pausing transcription.
         """
         now = time.monotonic()
-        # 1. 硬中断：用户、TTS、视频播放或冷却期
         if self.user_interrupt_request.is_set() or self.tts_is_speaking_event.is_set() or \
            self.video_is_playing_event.is_set() or (now < self.quiet_until.value):
             return True
 
-        # 2. 软中断：如果当前没有在处理一个句子，且助手正忙（思考、说话、浏览器任务），则暂停。
-        #    这可以防止在助手说话时开始新的识别。
         if not self.speech_triggered and self.assistant.state != AssistantState.IDLE:
             return True
             
@@ -450,7 +446,6 @@ class StreamingTranscriber:
         except Exception as e:
             logging.warning(f"Could not start audio stream: {e}", exc_info=False)
 
-    # 【最终优化】重构后的 _transcription_worker
     def _transcription_worker(self):
         if not self.model:
             logging.error("ASR model not loaded. Transcription worker cannot start.")
@@ -464,42 +459,33 @@ class StreamingTranscriber:
 
         while self._is_running:
             try:
-                # 使用集中的判断逻辑
                 if self._should_pause_processing():
-                    # 【修复】只在首次进入暂停状态时执行清理和重置
                     if not self.was_paused_in_prev_iter:
                         logging.info("ASR processing is paused.")
                         self._pause_microphone()
                         
-                        # 将所有清理工作移到这里
                         with self.audio_queue.mutex: self.audio_queue.queue.clear()
                         vad_process_buffer = np.array([], dtype=np.float32)
                         asr_audio_buffer = np.array([], dtype=np.float32)
                         last_printed_text = ""
-                        # 在进入暂停时重置一次ASR状态，确保下次恢复时是干净的
                         self._reset_asr_state() 
                         
                         self.was_paused_in_prev_iter = True
                     
-                    # 在暂停状态下，只需要简单地sleep，等待条件变化
                     time.sleep(0.05)
                     continue
 
-                # 如果是从暂停状态恢复
                 if self.was_paused_in_prev_iter:
                     logging.info("ASR processing has resumed.")
-                    # 在恢复时，确保麦克风已启动，并再次重置状态
                     self._resume_microphone()
                     self._reset_asr_state()
                     last_printed_text = ""
-                    # 清空可能在转换瞬间进入的任何缓冲
                     vad_process_buffer = np.array([], dtype=np.float32)
                     asr_audio_buffer = np.array([], dtype=np.float32)
                     with self.audio_queue.mutex: self.audio_queue.queue.clear()
 
                     self.was_paused_in_prev_iter = False
 
-                # 从这里开始是正常的VAD/ASR处理
                 audio_chunk = self.audio_queue.get(timeout=0.1)
                 vad_process_buffer = np.concatenate([vad_process_buffer, audio_chunk[:, 0]])
 
@@ -653,7 +639,6 @@ class GemmaChatEngine:
                 final_payload = "".join(browser_payload_parts).replace("<eos>", "").strip().rstrip('"}\n```')
                 return {"intent": "browseruse", "payload": final_payload}
 
-# KeyPressListener 的职责被简化，只负责通知主助手
 class KeyPressListener:
     """
     Listens for a specific key press (Command key) to trigger a global reset signal.
@@ -676,8 +661,6 @@ class KeyPressListener:
         if the Command key is pressed.
         """
         if key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
-            # 无论当前状态如何，只要按下 Command 键，就设置全局命令事件
-            # 这是此类的唯一职责
             if not self.assistant.global_command_event.is_set():
                 logging.info("GLOBAL COMMAND key pressed. Signaling a full system reset.")
                 self.assistant.global_command_event.set()
@@ -879,17 +862,6 @@ class BrowserController:
             logging.info("Shutting down browser session as part of application exit.")
             await self.browser_session.kill()
             self.browser_session = None
-
-import time
-import queue
-import threading
-import logging
-import asyncio
-from collections import deque
-from enum import Enum, auto
-
-# 假设其他所有依赖类 (Config, StreamingTranscriber, GemmaChatEngine, etc.) 都已定义
-# 以下是 VoiceAssistant 类的完整代码
 
 class AssistantState(Enum):
     """Defines the possible states of the voice assistant for robust state management."""
