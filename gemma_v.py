@@ -2,7 +2,7 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - (%(threadName)-10s) - %(message)s')
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - [%(levelname)s] - (%(threadName)-10s) - %(message)s')
 
 import sounddevice as sd
 import numpy as np
@@ -10,6 +10,9 @@ import time
 import queue
 import threading
 import json
+from rich.live import Live
+from rich.panel import Panel
+import shutil # rich 需要这个来获取终端宽度
 
 import torch
 import mlx.core as mx
@@ -457,9 +460,16 @@ class StreamingTranscriber:
         last_printed_text = ""
         ASR_FEED_CHUNK_SIZE = 16000
 
+        # rich.live 的上下文管理器
+        live_display: Live | None = None
+
         while self._is_running:
             try:
                 if self._should_pause_processing():
+                    if live_display:  # 如果正在显示，先停止
+                        live_display.stop()
+                        live_display = None
+                    
                     if not self.was_paused_in_prev_iter:
                         logging.info("ASR processing is paused.")
                         self._pause_microphone()
@@ -497,9 +507,17 @@ class StreamingTranscriber:
                     if is_speech:
                         if not self.speech_triggered:
                             self.assistant.set_state(AssistantState.LISTENING)
-                            print(f"\n{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC} ", end="", flush=True)
                             self.speech_triggered = True
                             logging.info("VAD: Speech started. State -> LISTENING")
+                            
+                            # 初始化 Live display，并立即显示 "User: " 标签
+                            user_label = f"{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC}"
+                            # 使用 Panel 创建一个带标题的盒子，内容暂时为空
+                            initial_panel = Panel("", title=user_label, border_style="green", title_align="left")
+                            live_display = Live(initial_panel, auto_refresh=False, vertical_overflow="visible")
+                            live_display.start()
+                            live_display.refresh() # 立即显示初始面板
+
                         self.silence_chunks_counter = 0
                         asr_audio_buffer = np.concatenate([asr_audio_buffer, chunk_to_process])
                     elif self.speech_triggered:
@@ -510,21 +528,37 @@ class StreamingTranscriber:
                         self.transcriber.add_audio(mx.array(asr_audio_buffer))
                         asr_audio_buffer = np.array([], dtype=np.float32)
 
-                    if self.speech_triggered:
+                    if self.speech_triggered and live_display:
                         current_text = self.transcriber.result.text.strip()
                         if current_text != last_printed_text:
-                            print(f"\r{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC} {current_text}", end="", flush=True)
+                            # 使用 rich.live 更新显示内容
+                            user_label = f"{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC}"
+                            # 创建一个新的 Panel 并更新 Live 显示
+                            display_panel = Panel(current_text, title=user_label, border_style="green", title_align="left")
+                            live_display.update(display_panel, refresh=True)
                             last_printed_text = current_text
 
                     if self.speech_triggered and self.silence_chunks_counter > self.config.VAD_SILENCE_THRESHOLD_CHUNKS:
+                        final_text = last_printed_text.strip()
+                        
+                        if live_display:
+                            if final_text:
+                                # 在停止前，最后更新一次以固化最终文本
+                                user_label = f"{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC}"
+                                final_panel = Panel(final_text, title=user_label, border_style="green", title_align="left")
+                                live_display.update(final_panel, refresh=True)
+                            live_display.stop()  # 结束 live display
+                            live_display = None
+                        
+                        # 确保在没有文本的情况下也打印一个换行符，以避免光标停在奇怪的位置
+                        if not final_text:
+                            print()
+
                         if len(asr_audio_buffer) > 0:
                             self.transcriber.add_audio(mx.array(asr_audio_buffer))
                             asr_audio_buffer = np.array([], dtype=np.float32)
 
-                        final_text = last_printed_text.strip()
-
                         if final_text:
-                            print()
                             logging.info(f"Final transcript: '{final_text}'")
                             self.final_transcript_queue.put(final_text)
                         
@@ -535,6 +569,9 @@ class StreamingTranscriber:
             except queue.Empty:
                 continue
             except Exception as e:
+                if live_display:
+                    live_display.stop()
+                    live_display = None
                 logging.error(f"Error in ASR worker: {e}", exc_info=True)
                 self._reset_asr_state()
                 last_printed_text = ""
@@ -836,12 +873,12 @@ class BrowserController:
                 final_result = history.final_result()
 
                 if self.video_is_playing_event.is_set():
-                    logging.info("Agent task finished, and a video is playing. Handing off to monitor.")
+                    print("Agent task finished, and a video is playing.")
                 elif final_result:
-                    logging.info(f"Browser task finished. Final result: {final_result}")
+                    print(f"Browser task finished. Final result: {final_result}")
                     self.tts.play_greeting(f"Task complete. Here is the result: {final_result}")
                 else:
-                    logging.info("Browser task finished with no final result.")
+                    print("Browser task finished with no final result.")
                     self.tts.play_greeting("I've completed the browser task.")
             
         except Exception as e:
