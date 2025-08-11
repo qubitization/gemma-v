@@ -1,6 +1,8 @@
 # gemma_v.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - (%(threadName)-10s) - %(message)s')
 
 import sounddevice as sd
 import numpy as np
@@ -8,7 +10,7 @@ import time
 import queue
 import threading
 import json
-import logging
+
 import torch
 import mlx.core as mx
 
@@ -18,7 +20,7 @@ import re
 import gc
 import multiprocessing as mp
 from pynput import keyboard
-from typing import List, Dict, Coroutine
+from typing import List, Dict, Coroutine, Callable
 import asyncio
 from enum import Enum, auto
 
@@ -51,10 +53,7 @@ load_dotenv()
 # 0. SETUP AND CONFIGURATION
 # =================================================================
 # --- Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - (%(threadName)-10s) - %(message)s')
-root = logging.getLogger()
-for h in root.handlers:
-    h.setLevel(logging.INFO)
+
 
 # --- System Prompt for Intent Routing ---
 SYSTEM_PROMPT = r"""You are a highly specialized AI assistant that functions as an intent router. Your primary task is to analyze the user's prompt and respond with a single JSON object that classifies the user's intent and contains the appropriate response.
@@ -147,11 +146,13 @@ class TTSProcessWorker(mp.Process):
     It can be interrupted via an mp.Event without being terminated.
     """
     # CLARITY: Renamed interrupt_event to tts_stop_signal
-    def __init__(self, sentence_queue: mp.JoinableQueue, config_dict: dict, tts_stop_signal: mp.Event, tts_is_speaking_event: mp.Event):
+    def __init__(self, sentence_queue: mp.JoinableQueue, config_dict: dict,
+                 tts_stop_signal: mp.Event, tts_is_speaking_event: mp.Event, quiet_until: mp.Value):
         super().__init__()
         self.sentence_queue = sentence_queue
         self.tts_stop_signal = tts_stop_signal
         self.tts_is_speaking_event = tts_is_speaking_event
+        self.quiet_until = quiet_until
         self.model_path = config_dict.get('PIPER_MODEL_PATH')
         self.length_scale = config_dict.get('PIPER_LENGTH_SCALE')
         self.noise_scale = config_dict.get('PIPER_NOISE_SCALE')
@@ -203,6 +204,7 @@ class TTSProcessWorker(mp.Process):
                 except Exception as e: 
                     logging.error(f"[TTS Process] Error during synthesis: {e}")
                 finally:
+                    self.quiet_until.value = time.monotonic() + 0.4
                     self.tts_is_speaking_event.clear()
 
                 self.sentence_queue.task_done()
@@ -222,6 +224,10 @@ class StreamingTTSEngine:
         # CLARITY: Renamed interrupt_event to tts_stop_signal
         self.tts_stop_signal = mp.Event() 
         self.tts_is_speaking_event = tts_is_speaking_event
+        # cooldown shared with ASR
+        self.quiet_until = mp.Value('d', 0.0)
+        # optional callback to record sentences (for echo filter)
+        self.on_sentence_enqueued = None
 
     def _start_worker_if_needed(self):
         if self.tts_process is None or not self.tts_process.is_alive():
@@ -239,18 +245,23 @@ class StreamingTTSEngine:
                 self.tts_process = None
                 return
             
-            self.tts_process = TTSProcessWorker(self.sentence_queue, config_dict, self.tts_stop_signal, self.tts_is_speaking_event)
+            self.tts_process = TTSProcessWorker(self.sentence_queue, config_dict,
+                                                self.tts_stop_signal, self.tts_is_speaking_event, self.quiet_until)
             self.tts_process.start()
 
-    def interrupt(self):
+    def interrupt(self, wait_ack: bool = True, timeout: float = 1.0):
         logging.info("[TTS Controller] INTERRUPT: Signaling TTS worker to stop and clear queue.")
         self.tts_stop_signal.set()
-        self.tts_is_speaking_event.clear()
         
         if self.sentence_queue:
             while not self.sentence_queue.empty():
                 try: self.sentence_queue.get_nowait()
                 except queue.Empty: break
+        # wait for TTS process to actually drop speaking flag
+        if wait_ack:
+            start = time.monotonic()
+            while self.tts_is_speaking_event.is_set() and (time.monotonic() - start) < timeout:
+                time.sleep(0.01)
 
     # CLARITY: Renamed barge_in_event to user_interrupt_request
     def speak(self, text_generator, user_interrupt_request: threading.Event, generation_done_event: threading.Event):
@@ -289,6 +300,9 @@ class StreamingTTSEngine:
                             if s.strip():
                                 if self.sentence_queue and self.tts_process and self.tts_process.is_alive():
                                     try:
+                                        if self.on_sentence_enqueued:
+                                            try: self.on_sentence_enqueued(s.strip())
+                                            except Exception: pass
                                         self.sentence_queue.put(s.strip(), timeout=0.5)
                                     except queue.Full:
                                         logging.warning("TTS queue full, likely due to user interrupt. Halting feeder.")
@@ -308,6 +322,9 @@ class StreamingTTSEngine:
                 if not user_interrupt_request.is_set() and (last_sentence := sentence_buffer.strip()):
                     if self.sentence_queue and self.tts_process and self.tts_process.is_alive():
                         clean_last_sentence = last_sentence.rstrip('"}\n```')
+                        if self.on_sentence_enqueued:
+                            try: self.on_sentence_enqueued(clean_last_sentence)
+                            except Exception: pass
                         self.sentence_queue.put(clean_last_sentence)
 
             except Exception as e:
@@ -343,12 +360,14 @@ class StreamingTTSEngine:
 
 class StreamingTranscriber:
     # CLARITY: Renamed barge_in_event to user_interrupt_request
-    def __init__(self, config: Config, tts_is_speaking_event: mp.Event, user_interrupt_request: threading.Event, video_is_playing_event: threading.Event):
+    def __init__(self, assistant: 'VoiceAssistant', config: Config, tts_is_speaking_event: mp.Event, user_interrupt_request: threading.Event, video_is_playing_event: threading.Event, quiet_until: mp.Value):
         logging.info("Initializing Streaming Transcriber with Parakeet...")
+        self.assistant = assistant # 存储对主助手的引用
         self.config = config
         self.tts_is_speaking_event = tts_is_speaking_event
         self.user_interrupt_request = user_interrupt_request
         self.video_is_playing_event = video_is_playing_event
+        self.quiet_until = quiet_until
 
         self._load_asr_model()
         self.transcriber = None
@@ -363,8 +382,7 @@ class StreamingTranscriber:
         self._worker_thread = None
         self.speech_triggered = False
         self.silence_chunks_counter = 0
-        self.was_tts_speaking_prev_iter = False
-        self.was_video_playing_prev_iter = False
+        self.was_paused_in_prev_iter = False # 【优化】用于减少日志噪音
 
     def _load_asr_model(self):
         logging.info(f"Loading Parakeet ASR model: {self.config.ASR_MODEL_REPO}")
@@ -397,6 +415,42 @@ class StreamingTranscriber:
         else:
             self.transcriber = None
 
+    # 【优化】新增的辅助方法，用于集中管理所有暂停逻辑
+    def _should_pause_processing(self) -> bool:
+        """
+        Determines if the ASR processing should be paused.
+        This is the single source of truth for pausing transcription.
+        """
+        now = time.monotonic()
+        # 1. 硬中断：用户、TTS、视频播放或冷却期
+        if self.user_interrupt_request.is_set() or self.tts_is_speaking_event.is_set() or \
+           self.video_is_playing_event.is_set() or (now < self.quiet_until.value):
+            return True
+
+        # 2. 软中断：如果当前没有在处理一个句子，且助手正忙（思考、说话、浏览器任务），则暂停。
+        #    这可以防止在助手说话时开始新的识别。
+        if not self.speech_triggered and self.assistant.state != AssistantState.IDLE:
+            return True
+            
+        return False
+
+    def _pause_microphone(self):
+        """Helper to stop the audio stream."""
+        try:
+            if self.audio_stream and self.audio_stream.active:
+                self.audio_stream.stop()
+        except Exception as e:
+            logging.warning(f"Could not stop audio stream: {e}", exc_info=False)
+
+    def _resume_microphone(self):
+        """Helper to start the audio stream."""
+        try:
+            if self.audio_stream and not self.audio_stream.active:
+                self.audio_stream.start()
+        except Exception as e:
+            logging.warning(f"Could not start audio stream: {e}", exc_info=False)
+
+    # 【最终优化】重构后的 _transcription_worker
     def _transcription_worker(self):
         if not self.model:
             logging.error("ASR model not loaded. Transcription worker cannot start.")
@@ -410,47 +464,42 @@ class StreamingTranscriber:
 
         while self._is_running:
             try:
-                if self.video_is_playing_event.is_set():
-                    if not self.was_video_playing_prev_iter:
-                        logging.info("ASR paused for video playback.")
+                # 使用集中的判断逻辑
+                if self._should_pause_processing():
+                    # 【修复】只在首次进入暂停状态时执行清理和重置
+                    if not self.was_paused_in_prev_iter:
+                        logging.info("ASR processing is paused.")
+                        self._pause_microphone()
+                        
+                        # 将所有清理工作移到这里
                         with self.audio_queue.mutex: self.audio_queue.queue.clear()
                         vad_process_buffer = np.array([], dtype=np.float32)
                         asr_audio_buffer = np.array([], dtype=np.float32)
-                        self._reset_asr_state()
-                    self.was_video_playing_prev_iter = True
-                    time.sleep(0.1)
+                        last_printed_text = ""
+                        # 在进入暂停时重置一次ASR状态，确保下次恢复时是干净的
+                        self._reset_asr_state() 
+                        
+                        self.was_paused_in_prev_iter = True
+                    
+                    # 在暂停状态下，只需要简单地sleep，等待条件变化
+                    time.sleep(0.05)
                     continue
-                if self.was_video_playing_prev_iter:
-                    logging.info("ASR resumed after video playback.")
-                self.was_video_playing_prev_iter = False
 
-                if self.user_interrupt_request.is_set():
-                    with self.audio_queue.mutex: self.audio_queue.queue.clear()
-                    vad_process_buffer = np.array([], dtype=np.float32)
-                    asr_audio_buffer = np.array([], dtype=np.float32)
+                # 如果是从暂停状态恢复
+                if self.was_paused_in_prev_iter:
+                    logging.info("ASR processing has resumed.")
+                    # 在恢复时，确保麦克风已启动，并再次重置状态
+                    self._resume_microphone()
                     self._reset_asr_state()
                     last_printed_text = ""
-                    logging.info("ASR worker state reset due to user interrupt.")
-                    while self.user_interrupt_request.is_set():
-                        time.sleep(0.1)
-                    logging.info("ASR worker resuming after user interrupt signal cleared.")
-                    continue
-
-                if self.tts_is_speaking_event.is_set():
-                    if not self.was_tts_speaking_prev_iter: logging.info("ASR/VAD paused for TTS.")
-                    self.was_tts_speaking_prev_iter = True
-                    with self.audio_queue.mutex: self.audio_queue.queue.clear()
+                    # 清空可能在转换瞬间进入的任何缓冲
                     vad_process_buffer = np.array([], dtype=np.float32)
                     asr_audio_buffer = np.array([], dtype=np.float32)
-                    time.sleep(0.1)
-                    continue
+                    with self.audio_queue.mutex: self.audio_queue.queue.clear()
 
-                if self.was_tts_speaking_prev_iter:
-                    logging.info("ASR/VAD resumed.")
-                    self._reset_asr_state()
-                    last_printed_text = ""
-                self.was_tts_speaking_prev_iter = False
+                    self.was_paused_in_prev_iter = False
 
+                # 从这里开始是正常的VAD/ASR处理
                 audio_chunk = self.audio_queue.get(timeout=0.1)
                 vad_process_buffer = np.concatenate([vad_process_buffer, audio_chunk[:, 0]])
 
@@ -461,9 +510,10 @@ class StreamingTranscriber:
 
                     if is_speech:
                         if not self.speech_triggered:
+                            self.assistant.set_state(AssistantState.LISTENING)
                             print(f"\n{TermColors.BOLD}{TermColors.USER}User:{TermColors.ENDC} ", end="", flush=True)
                             self.speech_triggered = True
-                            logging.info("VAD: Speech started.")
+                            logging.info("VAD: Speech started. State -> LISTENING")
                         self.silence_chunks_counter = 0
                         asr_audio_buffer = np.concatenate([asr_audio_buffer, chunk_to_process])
                     elif self.speech_triggered:
@@ -471,7 +521,6 @@ class StreamingTranscriber:
                         asr_audio_buffer = np.concatenate([asr_audio_buffer, chunk_to_process])
 
                     if len(asr_audio_buffer) >= ASR_FEED_CHUNK_SIZE:
-                        logging.info(f"ASR buffer full ({len(asr_audio_buffer)} samples), feeding to transcriber.")
                         self.transcriber.add_audio(mx.array(asr_audio_buffer))
                         asr_audio_buffer = np.array([], dtype=np.float32)
 
@@ -482,9 +531,7 @@ class StreamingTranscriber:
                             last_printed_text = current_text
 
                     if self.speech_triggered and self.silence_chunks_counter > self.config.VAD_SILENCE_THRESHOLD_CHUNKS:
-                        logging.info("VAD: Silence threshold exceeded. Finalizing utterance.")
                         if len(asr_audio_buffer) > 0:
-                            logging.info(f"Feeding final {len(asr_audio_buffer)} audio samples to transcriber.")
                             self.transcriber.add_audio(mx.array(asr_audio_buffer))
                             asr_audio_buffer = np.array([], dtype=np.float32)
 
@@ -494,16 +541,20 @@ class StreamingTranscriber:
                             print()
                             logging.info(f"Final transcript: '{final_text}'")
                             self.final_transcript_queue.put(final_text)
-
+                        
                         self._reset_asr_state()
                         last_printed_text = ""
                         break
 
-            except queue.Empty: continue
+            except queue.Empty:
+                continue
             except Exception as e:
                 logging.error(f"Error in ASR worker: {e}", exc_info=True)
                 self._reset_asr_state()
-                last_printed_text = ""; vad_process_buffer = np.array([], dtype=np.float32); asr_audio_buffer = np.array([], dtype=np.float32)
+                last_printed_text = ""
+                vad_process_buffer = np.array([], dtype=np.float32)
+                asr_audio_buffer = np.array([], dtype=np.float32)
+                self.was_paused_in_prev_iter = False
 
     def start(self):
         if self._is_running: return
@@ -602,38 +653,47 @@ class GemmaChatEngine:
                 final_payload = "".join(browser_payload_parts).replace("<eos>", "").strip().rstrip('"}\n```')
                 return {"intent": "browseruse", "payload": final_payload}
 
+# KeyPressListener 的职责被简化，只负责通知主助手
 class KeyPressListener:
-    # CLARITY: Renamed barge_in_event to user_interrupt_request
-    def __init__(self, assistant: 'VoiceAssistant', user_interrupt_request: threading.Event, video_is_playing_event: threading.Event, go_home_event: threading.Event):
+    """
+    Listens for a specific key press (Command key) to trigger a global reset signal.
+    Its sole responsibility is to set the `global_command_event` in the main
+    assistant class, decoupling the input event from the reset logic itself.
+    """
+    def __init__(self, assistant: 'VoiceAssistant'):
+        """
+        Initializes the listener.
+
+        Args:
+            assistant: A reference to the main VoiceAssistant instance to signal the event.
+        """
         self.assistant = assistant
-        self.user_interrupt_request = user_interrupt_request
-        self.video_is_playing_event = video_is_playing_event
-        self.go_home_event = go_home_event
         self.listener = None
 
     def _on_press(self, key):
+        """
+        Callback function executed on a key press. Sets the global command event
+        if the Command key is pressed.
+        """
         if key in (keyboard.Key.cmd_l, keyboard.Key.cmd_r):
-            current_state = self.assistant.state
+            # 无论当前状态如何，只要按下 Command 键，就设置全局命令事件
+            # 这是此类的唯一职责
+            if not self.assistant.global_command_event.is_set():
+                logging.info("GLOBAL COMMAND key pressed. Signaling a full system reset.")
+                self.assistant.global_command_event.set()
 
-            if self.video_is_playing_event.is_set():
-                logging.info("Command key pressed during video playback. Signaling 'Reset & Ready'.")
-                print(f"\n{TermColors.SYSTEM}Reset command received. Stopping task and returning to home...{TermColors.ENDC}")
-                self.go_home_event.set()
-
-            elif current_state in [AssistantState.THINKING, AssistantState.SPEAKING]:
-                logging.info(f"Command key pressed during {current_state.name}. Signaling USER INTERRUPT.")
-                print(f"\n{TermColors.SYSTEM}User interrupt activated. Silenced.{TermColors.ENDC}")
-                self.user_interrupt_request.set()
-                
     def start(self):
+        """Starts the keyboard listener thread."""
         if self.listener is None:
             self.listener = keyboard.Listener(on_press=self._on_press)
             self.listener.start()
-            logging.info("Keypress listener started. Press 'Command' to interrupt.")
+            logging.info("Keypress listener started. Press 'Command' for a global reset.")
 
     def stop(self):
+        """Stops the keyboard listener thread."""
         if self.listener and self.listener.is_alive():
-            self.listener.stop(); self.listener.join()
+            self.listener.stop()
+            self.listener.join()
         self.listener = None
 
 class GeneratorWithReturnValue:
@@ -788,14 +848,12 @@ class BrowserController:
             if watcher_task in done:
                 logging.info("'Reset & Ready' signal received. Stopping agent and navigating home.")
                 await self._navigate_to_home()
-                self.tts.play_greeting("Okay, I've stopped that. What's next?")
             else: 
                 history = await agent_task
                 final_result = history.final_result()
 
                 if self.video_is_playing_event.is_set():
                     logging.info("Agent task finished, and a video is playing. Handing off to monitor.")
-                    self.tts.play_greeting("The video is now playing. To stop and reset, press the Command key.")
                 elif final_result:
                     logging.info(f"Browser task finished. Final result: {final_result}")
                     self.tts.play_greeting(f"Task complete. Here is the result: {final_result}")
@@ -822,25 +880,59 @@ class BrowserController:
             await self.browser_session.kill()
             self.browser_session = None
 
-class VoiceAssistant:
-    def __init__(self, config: Config):
-        self.config = config
+import time
+import queue
+import threading
+import logging
+import asyncio
+from collections import deque
+from enum import Enum, auto
 
+# 假设其他所有依赖类 (Config, StreamingTranscriber, GemmaChatEngine, etc.) 都已定义
+# 以下是 VoiceAssistant 类的完整代码
+
+class AssistantState(Enum):
+    """Defines the possible states of the voice assistant for robust state management."""
+    IDLE = auto()              # Waiting for user to speak
+    LISTENING = auto()         # Actively recording and transcribing user speech (managed by ASR)
+    THINKING = auto()          # Awaiting response from the LLM
+    SPEAKING = auto()          # Streaming LLM response to TTS
+    BUSY_BROWSER = auto()      # Executing a browser task
+
+class TermColors:
+    ASSISTANT = '\033[94m'
+    USER = '\033[92m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    SYSTEM = '\033[91m'
+
+class VoiceAssistant:
+    def __init__(self, config: 'Config'):
+        self.config = config
         self.state = AssistantState.IDLE
         self.state_lock = threading.Lock()
 
+        # --- Event Flags for Cross-Thread Communication ---
         self.tts_is_speaking_event = mp.Event()
-        # CLARITY: Renamed barge_in_event to user_interrupt_request
-        self.user_interrupt_request = threading.Event()
+        self.user_interrupt_request = threading.Event() # For fine-grained LLM/TTS interruption
         self.video_is_playing_event = threading.Event()
-        self.go_home_event = threading.Event()
+        self.go_home_event = threading.Event()          # For browser task-specific interruption
 
+        # [NEW] The core of the new design: A high-priority global reset event.
+        self.global_command_event = threading.Event()
+
+        # --- Component Initialization ---
         self.gemma = GemmaChatEngine(config)
         self.tts = StreamingTTSEngine(config, self.tts_is_speaking_event)
-        self.transcriber = StreamingTranscriber(config, self.tts_is_speaking_event, self.user_interrupt_request, self.video_is_playing_event)
-        self.key_listener = KeyPressListener(self, self.user_interrupt_request, self.video_is_playing_event, self.go_home_event)
+        self._recent_tts = deque(maxlen=8)
+        self.tts.on_sentence_enqueued = self._record_tts_sentence
+        self.transcriber = StreamingTranscriber(self, config, self.tts_is_speaking_event,
+                                                self.user_interrupt_request, self.video_is_playing_event,
+                                                self.tts.quiet_until)
+        self.key_listener = KeyPressListener(self) # Listener now only needs the assistant reference
         self.browser_controller = BrowserController(self.tts, self.video_is_playing_event)
         
+        # --- Thread and Asyncio Management ---
         self.browser_task_thread: threading.Thread | None = None
         self.asyncio_loop: asyncio.AbstractEventLoop | None = None
         self.asyncio_thread: threading.Thread | None = None
@@ -855,6 +947,23 @@ class VoiceAssistant:
                 logging.info(f"State changed from {self.state.name} to {new_state.name}")
                 self.state = new_state
 
+    def _record_tts_sentence(self, s: str):
+        try:
+            if s and isinstance(s, str): self._recent_tts.append(s)
+        except Exception: pass
+
+    def _looks_like_echo(self, text: str) -> bool:
+        # (This method remains unchanged from your original code)
+        import re
+        def norm(t: str) -> str: return re.sub(r'\W+', ' ', t.lower()).strip()
+        A = set(norm(text).split())
+        if not A: return False
+        for sent in list(self._recent_tts):
+            B = set(norm(sent).split())
+            if not B: continue
+            if len(A & B) / max(1, len(A | B)) >= 0.7 or norm(text).startswith(norm(sent)[:60]): return True
+        return False
+
     def _start_asyncio_loop(self):
         logging.info("Starting asyncio event loop thread.")
         self.asyncio_loop = asyncio.new_event_loop()
@@ -864,26 +973,21 @@ class VoiceAssistant:
         self.asyncio_loop.close()
         logging.info("Asyncio event loop has been closed.")
 
-    def _submit_coro_and_wait(self, coro: Coroutine):
+    def _submit_coro_and_wait(self, coro):
         if not self.asyncio_loop or not self.asyncio_loop.is_running():
             logging.error("Cannot submit coroutine, asyncio loop is not running.")
             return
-
         future = asyncio.run_coroutine_threadsafe(coro, self.asyncio_loop)
-        try:
-            return future.result()
+        try: return future.result()
         except Exception as e:
             logging.error(f"Error in coroutine execution: {e}", exc_info=True)
             return e
 
     def _handle_browser_task(self, task: str):
+        # (This method remains unchanged from your original code)
         try:
-            self._submit_coro_and_wait(
-                self.browser_controller.run_browser_task(task, self.go_home_event)
-            )
-
+            self._submit_coro_and_wait(self.browser_controller.run_browser_task(task, self.go_home_event))
             if self.go_home_event.is_set(): return
-
             if self.video_is_playing_event.is_set():
                 logging.info("Browser thread entered post-task monitoring. Waiting for 'Go Home' signal or navigation away.")
                 while self.video_is_playing_event.is_set():
@@ -893,13 +997,55 @@ class VoiceAssistant:
                         self.tts.play_greeting("Okay, I've reset the browser.")
                         break
                     time.sleep(0.1)
-
-        except Exception as e:
-            logging.error(f"Error running browser task thread: {e}", exc_info=True)
+        except Exception as e: logging.error(f"Error running browser task thread: {e}", exc_info=True)
         finally:
             if self.video_is_playing_event.is_set(): self.video_is_playing_event.clear()
             self.go_home_event.clear()
             logging.info("Browser task thread finished. Assistant is ready for new commands.")
+
+    def _perform_global_reset(self):
+        """
+        Handles the global command event. This is the "escape hatch" that provides
+        ultimate control and robustness. It stops all activities, cleans up state,
+        and prepares for a new command.
+        """
+        print(f"\n{TermColors.SYSTEM}{TermColors.BOLD}Resetting...{TermColors.ENDC}")
+        logging.info("GLOBAL RESET SEQUENCE INITIATED")
+
+        # 1. Broadcast stop signals to all subsystems
+        self.user_interrupt_request.set()  # Stops LLM generation
+        self.go_home_event.set()           # Stops browser task
+        self.tts.interrupt(wait_ack=True, timeout=1.0) # Stops and clears TTS
+
+        # 2. Wait for the browser task thread to terminate if it was running
+        if self.browser_task_thread and self.browser_task_thread.is_alive():
+            logging.info("Waiting for browser task thread to terminate...")
+            self.browser_task_thread.join(timeout=3.0)
+            if self.browser_task_thread.is_alive():
+                 logging.warning("Browser task thread did not terminate gracefully.")
+            self.browser_task_thread = None
+
+        # 3. Clean up internal state and queues
+        self.response_generator = None
+        self.generation_done_event = None
+        with self.transcriber.final_transcript_queue.mutex:
+            self.transcriber.final_transcript_queue.queue.clear()
+        
+        # 4. Reset all event flags to their default (cleared) state
+        self.user_interrupt_request.clear()
+        self.go_home_event.clear()
+        if self.video_is_playing_event.is_set():
+             self.video_is_playing_event.clear()
+
+        # 5. Reset the state machine to a known, clean state
+        self.set_state(AssistantState.IDLE)
+        
+        # 6. Play the prompt and print a message as requested by the user
+        self.tts.play_greeting("I am waiting for your new command.")
+        print(f"{TermColors.SYSTEM}{TermColors.BOLD}I am waiting for your new command.{TermColors.ENDC}")
+        
+        # 7. Clear the global command event itself, completing the reset cycle
+        self.global_command_event.clear()
 
     def run(self):
         self.asyncio_thread = threading.Thread(target=self._start_asyncio_loop, name="Asyncio-Loop-Thread", daemon=True)
@@ -909,16 +1055,26 @@ class VoiceAssistant:
         self.key_listener.start()
         self.transcriber.start()
         self.tts.play_greeting("Gemma V is ready. How can I help?")
-        print(f"\n{TermColors.BOLD}{TermColors.SYSTEM}Press the Command key to interrupt the assistant or reset a browser task.{TermColors.ENDC}\n", flush=True)
+        print(f"\n{TermColors.BOLD}{TermColors.SYSTEM}Press the Command key to reset the assistant and give a new command.{TermColors.ENDC}\n", flush=True)
 
         try:
             while True:
                 time.sleep(0.05)
 
+                # HIGHEST PRIORITY: Check for the global command event first.
+                # This is the core of the new robust design.
+                if self.global_command_event.is_set():
+                    self._perform_global_reset()
+                    # Skip the rest of the loop and start fresh
+                    continue
+
+                # The old `user_interrupt_request` can be kept for more granular
+                # interruption of just the LLM/TTS without a full browser reset,
+                # but the global command is now the main user-facing interrupt.
                 if self.user_interrupt_request.is_set():
-                    self.tts.interrupt()
+                    # This now only handles a "barge-in" on speaking, not a full reset.
+                    self.tts.interrupt(wait_ack=True, timeout=1.0)
                     self.user_interrupt_request.clear()
-                    
                     self.response_generator = None
                     self.generation_done_event = None
                     self.set_state(AssistantState.IDLE)
@@ -927,48 +1083,47 @@ class VoiceAssistant:
                     print("\n" + "="*20 + " WAITING FOR NEXT COMMAND " + "="*20)
                     continue
 
-                if self.state == AssistantState.IDLE:
+                # --- Main State Machine Logic (remains unchanged) ---
+                if self.state in (AssistantState.IDLE, AssistantState.LISTENING):
+                    if self.browser_task_thread and not self.browser_task_thread.is_alive():
+                        self.browser_task_thread.join()
+                        self.browser_task_thread = None
+                        self.set_state(AssistantState.IDLE)
                     try:
-                        if self.browser_task_thread and not self.browser_task_thread.is_alive():
-                            self.browser_task_thread.join()
-                            self.browser_task_thread = None
-                            logging.info("Browser thread joined. Assistant is ready for new commands.")
-
                         final_transcript = self.transcriber.final_transcript_queue.get_nowait()
-                        logging.info(f"Orchestrator received: '{final_transcript}'")
+                        if self._looks_like_echo(final_transcript):
+                            logging.info("Final transcript dropped as self-echo.")
+                            self.set_state(AssistantState.IDLE)
+                            continue
                         
+                        logging.info(f"Orchestrator received: '{final_transcript}'")
                         if "goodbye" in final_transcript.lower():
                             self.tts.play_greeting("Goodbye!"); time.sleep(2); break
                         elif "reset conversation" in final_transcript.lower():
                             self.gemma.reset(); self.tts.play_greeting("History cleared.")
+                            self.set_state(AssistantState.IDLE)
                         elif self.browser_task_thread and self.browser_task_thread.is_alive():
                             if not self.video_is_playing_event.is_set():
                                 self.tts.play_greeting("Please wait, I'm currently busy with a browser task.")
+                            self.set_state(AssistantState.IDLE)
                         else:
                             self.set_state(AssistantState.THINKING)
                             self.generation_done_event = threading.Event()
                             self.response_generator = GeneratorWithReturnValue(self.gemma.stream_intent_and_response(final_transcript, self.user_interrupt_request))
                             self.tts.speak(iter(self.response_generator), self.user_interrupt_request, self.generation_done_event)
                             self.set_state(AssistantState.SPEAKING)
-
-                    except queue.Empty:
-                        continue
-
+                    except queue.Empty: continue
+                
                 elif self.state == AssistantState.SPEAKING:
-                    if not self.generation_done_event or self.generation_done_event.is_set():
-                        queue_is_empty = (not self.tts.sentence_queue) or self.tts.sentence_queue.empty()
-                        speaking_is_done = not self.tts_is_speaking_event.is_set()
-
-                        if queue_is_empty and speaking_is_done:
+                    if self.generation_done_event and self.generation_done_event.is_set():
+                        queue_empty = (not self.tts.sentence_queue) or self.tts.sentence_queue.empty()
+                        speaking_done = not self.tts_is_speaking_event.is_set()
+                        if queue_empty and speaking_done:
                             result = self.response_generator.return_value if self.response_generator else None
-                            
-                            self.response_generator = None
-                            self.generation_done_event = None
-
+                            self.response_generator, self.generation_done_event = None, None
                             if result and result.get("intent") == "browseruse":
-                                payload = result.get("payload", "")
                                 self.browser_task_thread = threading.Thread(
-                                    target=self._handle_browser_task, args=(payload,), name="Browser-Task-Thread"
+                                    target=self._handle_browser_task, args=(result.get("payload", ""),), name="Browser-Task-Thread"
                                 )
                                 self.browser_task_thread.start()
                                 self.set_state(AssistantState.BUSY_BROWSER)
@@ -979,13 +1134,16 @@ class VoiceAssistant:
                 elif self.state == AssistantState.BUSY_BROWSER:
                     if not self.browser_task_thread or not self.browser_task_thread.is_alive():
                         self.set_state(AssistantState.IDLE)
-        
-        except KeyboardInterrupt: logging.info("Caught KeyboardInterrupt.")
+
+        except KeyboardInterrupt:
+            logging.info("Caught KeyboardInterrupt.")
         finally:
             self.shutdown()
 
     def shutdown(self):
         print("\nShutting down...")
+        # Set all events to ensure any waiting threads can exit gracefully
+        self.global_command_event.set()
         self.user_interrupt_request.set()
         self.go_home_event.set()
         
@@ -1000,7 +1158,6 @@ class VoiceAssistant:
         if self.asyncio_loop and self.asyncio_loop.is_running():
             logging.info("Shutting down async components...")
             self._submit_coro_and_wait(self.browser_controller.shutdown())
-            
             self.asyncio_loop.call_soon_threadsafe(self.asyncio_loop.stop)
         
         if self.asyncio_thread and self.asyncio_thread.is_alive():
