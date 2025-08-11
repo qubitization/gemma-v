@@ -2,6 +2,8 @@
 
 We built a fully conversational AI assistant on a laptop, using Gemma 3n to give the visually impaired voice-driven access to the entire web.
 
+![](img.png)
+
 Demo: https://www.youtube.com/watch?v=e6HVVWYjdtw
 
 ## Env
