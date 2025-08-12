@@ -15,7 +15,7 @@ Demo: https://www.youtube.com/watch?v=e6HVVWYjdtw
 conda create -n gemmav python=3.11.8
 conda activate gemmav
 conda install -c conda-forge "ffmpeg=7.1.1"
-pip install "torch==2.7.1" "torchaudio==2.7.1" "numpy==2.2.6" "pynput==1.8.1" "mlx==0.26.5" "mlx-lm==0.26.1" "mlx-vlm==0.3.2" "sounddevice==0.5.0" "piper-tts==1.3.0" "parakeet-mlx==0.3.5" "rich==14.1.0"                                 
+pip install "torch==2.7.1" "torchaudio==2.7.1" "numpy==2.2.6" "pynput==1.8.1" "mlx==0.26.5" "mlx-lm==0.26.1" "mlx-vlm==0.3.2" "sounddevice==0.5.0" "piper-tts==1.3.0" "parakeet-mlx==0.3.5" "rich==14.1.0" "openai==1.99.1"                                 
 ```
 
 

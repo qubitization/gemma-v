@@ -103,7 +103,7 @@ class Config:
     VAD_CHUNK_SIZE = 512
     VAD_SAMPLE_RATE = 16000
     VAD_THRESHOLD = 0.5
-    SILENCE_THRESHOLD_SECONDS = 0.7
+    SILENCE_THRESHOLD_SECONDS = 1.0
     _VAD_CHUNKS_PER_SECOND = VAD_SAMPLE_RATE / VAD_CHUNK_SIZE
     VAD_SILENCE_THRESHOLD_CHUNKS = int(SILENCE_THRESHOLD_SECONDS * _VAD_CHUNKS_PER_SECOND)
 
@@ -112,7 +112,7 @@ class Config:
     DTYPE = 'float32'
 
     # --- TTS Configuration ---
-    PIPER_MODEL_PATH = "/Users/zx/Documents/projects/gemma-v/models/en_US-lessac-low.onnx" # CHANGE THIS PATH
+    PIPER_MODEL_PATH = "models/en_US-lessac-low.onnx" # CHANGE THIS PATH
     PIPER_LENGTH_SCALE = 1.0
     PIPER_NOISE_SCALE = 0.667
     PIPER_NOISE_W_SCALE = 0.8
@@ -839,7 +839,8 @@ class BrowserController:
             await self.initialize_session()
 
             llm = ChatOpenAI(
-                model='google/gemini-2.5-flash-lite-preview-06-17',
+                # model='google/gemini-2.5-flash-lite-preview-06-17',
+                model='google/gemini-2.5-pro',
                 base_url='https://openrouter.ai/api/v1',
                 api_key=os.getenv('OPENROUTER_API_KEY'),
             )
